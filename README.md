@@ -100,6 +100,121 @@ Keep videos short (Gemini free tier has size/quota limits). Cookies expire — r
 
 ---
 
+## 中文部署教程（详细版）
+
+这份教程假设你要把它部署到一台**自己的云服务器（Linux）**上，用 Docker 运行，让远程的 MCP 客户端（如各类聊天平台）通过网址调用，实现「发一个 B 站链接，AI 就能看懂视频画面」。
+
+### 你需要准备
+
+1. 一台装了 **Docker** 的 Linux 服务器（1核1G 也能跑，处理视频那几秒会吃点内存，建议有 2G 内存或配了 swap）。
+2. 一个 **Google Gemini API Key**：去 [aistudio.google.com/apikey](https://aistudio.google.com/apikey) 免费申请。
+3. （下 B 站视频需要）一份**你自己的 B 站登录 Cookie**，下面第 4 步会讲怎么导出。
+
+### 第 1 步：拉代码
+
+```bash
+cd ~
+git clone <你的仓库地址>.git video-mcp
+cd video-mcp
+```
+
+### 第 2 步：写环境变量文件
+
+```bash
+cp .env.example video.env
+nano video.env
+```
+
+把 `GOOGLE_API_KEY=` 后面换成你自己的 Gemini Key。其它保持默认即可（`TRANSPORT_TYPE=sse` 表示走 HTTP，适合远程用）。保存退出：`Ctrl+O` 回车 `Ctrl+X`。
+
+### 第 3 步：（可选，但下 B 站视频几乎必需）准备 Cookie
+
+B 站对没有登录 Cookie 的请求会返回 **HTTP 412**，导致下载失败。解决办法是带上你自己的登录 Cookie：
+
+1. 电脑浏览器**登录 B 站**（bilibili.com）。
+2. 装浏览器扩展 **Cookie-Editor**，在 B 站页面点开它。
+3. 点 **Export → Export as Netscape**（⚠️ 一定要选 **Netscape** 格式，不是 JSON）。
+4. 把导出的内容保存成服务器上的 `~/video-mcp/bili-cookies.txt`：
+   ```bash
+   nano ~/video-mcp/bili-cookies.txt
+   ```
+   粘贴进去保存。文件开头应该是 `# Netscape HTTP Cookie File`。
+
+> Cookie 会过期。哪天视频又下不了（报 412 或要登录），重新导出覆盖这个文件、再 `docker restart video` 即可。
+
+### 第 4 步：构建镜像
+
+```bash
+docker build -t video-mcp .
+```
+
+第一次会下载 Node 基础镜像、安装 ffmpeg 和 yt-dlp、编译代码，需要一两分钟。看到 `naming to ... video-mcp` 就成功了。
+
+### 第 5 步：启动容器
+
+```bash
+docker run -d --name video --restart unless-stopped \
+  -p 18014:3000 \
+  --env-file ~/video-mcp/video.env \
+  -v ~/video-mcp/bili-cookies.txt:/app/bili-cookies.txt \
+  video-mcp
+```
+
+说明：
+- `-p 18014:3000`：把容器的 3000 端口映射到服务器的 18014（对外端口你可以改）。
+- `-v ...bili-cookies.txt...`：把 Cookie 文件挂进容器。**没做第 3 步（没 Cookie）就删掉这一行 `-v`**。
+- 注意挂载 Cookie **不要**加 `:ro`（只读），因为 yt-dlp 运行时会回写更新 Cookie。
+
+### 第 6 步：确认起来了
+
+```bash
+docker logs video
+```
+
+看到 `Server started with Streamable HTTP transport on port 3000` 就正常了。再确认 yt-dlp 装好：
+
+```bash
+docker exec video yt-dlp --version
+```
+
+能打印版本号（如 `2026.07.04`）即可。
+
+### 第 7 步：连接你的 MCP 客户端
+
+MCP 端点是：
+
+```
+http://你的服务器IP:18014/mcp
+```
+
+如果你用了域名 + 反向代理（如 Nginx / Caddy）转发到 `localhost:18014`，就用你的 `https://域名/mcp`。传输方式选 **Streamable HTTP**。
+
+### 第 8 步：怎么用
+
+在你的聊天客户端里，**明确要求调用 `video_recognition` 工具**，把链接作为 `filepath` 参数。例如对 AI 说：
+
+> 请调用 video_recognition 工具，filepath 填 https://www.bilibili.com/video/BVxxxxxxxxx/ ，帮我看看视频里是什么。
+
+> ⚠️ 如果你同时接了「网页读取」类工具（如 jina），AI 可能会把链接拿去读网页而不是下载视频。这时要明确说「不要读网页，用 video_recognition 下载视频看画面」。
+
+### 常见问题
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| 下载报 `HTTP Error 412` | B 站风控，没带登录 Cookie | 按第 3 步准备 `bili-cookies.txt` 并挂载 |
+| 报 `Read-only file system: /app/bili-cookies.txt` | 挂载 Cookie 时加了 `:ro` | 去掉 `:ro` 重新 run |
+| 报 `Requested format is not available` | 视频没有对应清晰度档 | 本 fork 已用 `-S res:480` 自动选档，一般不会遇到；若遇到可 `docker exec video yt-dlp --list-formats <链接>` 看有哪些档 |
+| 报 `429 Too Many Requests / exceeded your current quota` | Gemini Key 免费额度用完 / 被限流 | 换一个 Gemini Key（改 `video.env` 后 `docker restart video`），或等次日额度重置 |
+| AI 不调用视频工具，去读网页了 | 客户端优先用了别的工具 | 对话里点名 `video_recognition`，或临时停用网页读取类工具 |
+
+### 关于视频时长与费用
+
+- 视频识别很吃 Gemini 的 token，**建议只处理 1~3 分钟以内的短视频**。
+- Gemini 有免费额度，个人偶尔用足够；高频使用会触发限流或产生费用。
+- 本 fork 默认下载 480p 左右画质，已经尽量省流量和 token。
+
+---
+
 ## Credits & License
 
 - Upstream project: **[mario-andreschak/mcp_video_recognition](https://github.com/mario-andreschak/mcp_video_recognition)** — original image/audio/video recognition MCP server.
